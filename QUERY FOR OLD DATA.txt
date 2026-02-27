@@ -1,0 +1,409 @@
+1) Update OR No From A/R Payment Knock-Off to "UDF_ORNO" in A/R Invoice (MULTI-OR)
+
+UPDATE i
+SET i.UDF_ORNO = x.OrList
+FROM ARInvoice i
+CROSS APPLY (
+    SELECT STUFF((
+        SELECT ', ' + p.DocNo
+        FROM ARPaymentKnockOff k
+        JOIN ARPayment p ON p.DocKey = k.DocKey
+        WHERE k.KnockOffDocKey = i.DocKey
+        ORDER BY p.DocKey
+        FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS OrList
+) x
+WHERE ISNULL(LTRIM(RTRIM(i.UDF_ORNO)), '') = '';
+
+
+2) Update Loan No From Sales Invoice Description 2 & Further Description to UDF_LOANNO in Sales Invoice, AR Invoice, Cash Book - 
+
+BEGIN TRY
+    BEGIN TRAN;
+
+    DECLARE @FurtherCol SYSNAME;
+
+    SELECT TOP 1 @FurtherCol = c.name
+    FROM sys.columns c
+    WHERE c.object_id = OBJECT_ID('dbo.IVDTL')
+      AND c.name IN ('FurtherDesc','FurtherDescription','FurtherDesc2','Remark','Remarks','DetailRemark','UDF_FurtherDesc','UDF_FurtherDescription');
+
+    -- lengths
+    DECLARE @LenIV  INT = (SELECT c.max_length FROM sys.columns c WHERE c.object_id = OBJECT_ID('dbo.IV') AND c.name = 'UDF_LOANNO');
+    DECLARE @LenAR  INT = (SELECT c.max_length FROM sys.columns c WHERE c.object_id = OBJECT_ID('dbo.ARInvoice') AND c.name = 'UDF_LOANNO');
+    DECLARE @LenCB  INT = (SELECT c.max_length FROM sys.columns c WHERE c.object_id = OBJECT_ID('dbo.CB') AND c.name = 'UDF_LOANNO');
+
+    SET @LenIV = CASE WHEN @LenIV = -1 THEN 4000 WHEN @LenIV > 0 THEN @LenIV/2 ELSE 4000 END;
+    SET @LenAR = CASE WHEN @LenAR = -1 THEN 4000 WHEN @LenAR > 0 THEN @LenAR/2 ELSE 4000 END;
+    SET @LenCB = CASE WHEN @LenCB = -1 THEN 4000 WHEN @LenCB > 0 THEN @LenCB/2 ELSE 4000 END;
+
+    DECLARE @sql NVARCHAR(MAX) = N'
+    ;WITH LoanSrc AS
+    (
+        SELECT
+            d.DocKey,
+            LoanNo =
+                MAX(NULLIF(LTRIM(RTRIM(
+                    COALESCE(
+                        -- 1) further description parse (if column exists)
+                        CASE 
+                            WHEN @FurtherCol IS NOT NULL AND ' + CASE WHEN @FurtherCol IS NULL THEN '1=0' ELSE 'd.' + QUOTENAME(@FurtherCol) + ' LIKE ''{\rtf%''' END + N'
+                                 AND CHARINDEX(''\fs20 '', ' + CASE WHEN @FurtherCol IS NULL THEN 'N'''' ' ELSE 'd.' + QUOTENAME(@FurtherCol) END + N') > 0
+                            THEN
+                                LTRIM(RTRIM(
+                                    SUBSTRING(
+                                        ' + CASE WHEN @FurtherCol IS NULL THEN 'N'''' ' ELSE 'd.' + QUOTENAME(@FurtherCol) END + N',
+                                        CHARINDEX(''\fs20 '', ' + CASE WHEN @FurtherCol IS NULL THEN 'N'''' ' ELSE 'd.' + QUOTENAME(@FurtherCol) END + N') + 6,
+                                        CASE 
+                                            WHEN CHARINDEX(''\par'', ' + CASE WHEN @FurtherCol IS NULL THEN 'N'''' ' ELSE 'd.' + QUOTENAME(@FurtherCol) END + N', CHARINDEX(''\fs20 '', ' + CASE WHEN @FurtherCol IS NULL THEN 'N'''' ' ELSE 'd.' + QUOTENAME(@FurtherCol) END + N') + 6) > 0
+                                                THEN CHARINDEX(''\par'', ' + CASE WHEN @FurtherCol IS NULL THEN 'N'''' ' ELSE 'd.' + QUOTENAME(@FurtherCol) END + N', CHARINDEX(''\fs20 '', ' + CASE WHEN @FurtherCol IS NULL THEN 'N'''' ' ELSE 'd.' + QUOTENAME(@FurtherCol) END + N') + 6) - (CHARINDEX(''\fs20 '', ' + CASE WHEN @FurtherCol IS NULL THEN 'N'''' ' ELSE 'd.' + QUOTENAME(@FurtherCol) END + N') + 6)
+                                            WHEN CHARINDEX(''\cf0'', ' + CASE WHEN @FurtherCol IS NULL THEN 'N'''' ' ELSE 'd.' + QUOTENAME(@FurtherCol) END + N', CHARINDEX(''\fs20 '', ' + CASE WHEN @FurtherCol IS NULL THEN 'N'''' ' ELSE 'd.' + QUOTENAME(@FurtherCol) END + N') + 6) > 0
+                                                THEN CHARINDEX(''\cf0'', ' + CASE WHEN @FurtherCol IS NULL THEN 'N'''' ' ELSE 'd.' + QUOTENAME(@FurtherCol) END + N', CHARINDEX(''\fs20 '', ' + CASE WHEN @FurtherCol IS NULL THEN 'N'''' ' ELSE 'd.' + QUOTENAME(@FurtherCol) END + N') + 6) - (CHARINDEX(''\fs20 '', ' + CASE WHEN @FurtherCol IS NULL THEN 'N'''' ' ELSE 'd.' + QUOTENAME(@FurtherCol) END + N') + 6)
+                                            ELSE 50
+                                        END
+                                    )
+                                ))
+                            ELSE NULL
+                        END,
+                        NULLIF(LTRIM(RTRIM(d.Desc2)), '''')
+                    )
+                )), ''''))
+        FROM IVDTL d
+        GROUP BY d.DocKey
+    )
+    UPDATE iv
+    SET iv.UDF_LOANNO = LEFT(s.LOANNO, @LenIV)
+    FROM IV iv
+    JOIN LoanSrc s ON s.DocKey = iv.DocKey
+    WHERE ISNULL(LTRIM(RTRIM(iv.UDF_LOANNO)), '''') = ''''
+      AND s.LoanNo IS NOT NULL;
+    ';
+
+    EXEC sp_executesql
+        @sql,
+        N'@LenIV INT, @FurtherCol SYSNAME',
+        @LenIV = @LenIV,
+        @FurtherCol = @FurtherCol;
+
+    -- propagate to ARInvoice + CB
+    UPDATE ar
+    SET ar.UDF_LOANNO = LEFT(iv.UDF_LOANNO, @LenAR)
+    FROM ARInvoice ar
+    JOIN IV iv ON iv.DocNo = ar.DocNo
+    WHERE ISNULL(LTRIM(RTRIM(ar.UDF_LOANNO)), '') = ''
+      AND ISNULL(LTRIM(RTRIM(iv.UDF_LOANNO)), '') <> '';
+
+    UPDATE cb
+    SET cb.UDF_LOANNO = LEFT(iv.UDF_LOANNO, @LenCB)
+    FROM CB cb
+    JOIN ARPayment p ON p.DocKey = cb.SourceKey
+    JOIN ARPaymentKnockOff k ON k.DocKey = p.DocKey
+    JOIN ARInvoice ar ON ar.DocKey = k.KnockOffDocKey
+    JOIN IV iv ON iv.DocNo = ar.DocNo
+    WHERE ISNULL(LTRIM(RTRIM(cb.UDF_LOANNO)), '') = ''
+      AND ISNULL(LTRIM(RTRIM(iv.UDF_LOANNO)), '') <> '';
+
+    COMMIT TRAN;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+    THROW;
+END CATCH;
+
+-------------------------------------------------
+----------Double Confirm-------------------
+
+BEGIN TRY
+    BEGIN TRAN;
+
+    ;WITH Src AS
+    (
+        SELECT
+            cb.DocKey AS CBDocKey,
+
+            LoanList = STUFF((
+                SELECT DISTINCT ', ' + LTRIM(RTRIM(ar2.UDF_LOANNO))
+                FROM ARPaymentKnockOff k2
+                JOIN ARInvoice ar2 ON ar2.DocKey = k2.KnockOffDocKey
+                WHERE k2.DocKey = cb.SourceKey
+                  AND ISNULL(LTRIM(RTRIM(ar2.UDF_LOANNO)), '') <> ''
+                FOR XML PATH(''), TYPE
+            ).value('.', 'NVARCHAR(MAX)'), 1, 2, ''),
+
+            MemberList = STUFF((
+                SELECT DISTINCT ', ' + LTRIM(RTRIM(ar2.UDF_MEMBER))
+                FROM ARPaymentKnockOff k2
+                JOIN ARInvoice ar2 ON ar2.DocKey = k2.KnockOffDocKey
+                WHERE k2.DocKey = cb.SourceKey
+                  AND ISNULL(LTRIM(RTRIM(ar2.UDF_MEMBER)), '') <> ''
+                FOR XML PATH(''), TYPE
+            ).value('.', 'NVARCHAR(MAX)'), 1, 2, ''),
+
+            StartDateMin = MIN(NULLIF(ar.UDF_STARTDATE, '1900-01-01')),
+            EndDateMax   = MAX(NULLIF(ar.UDF_ENDDATE,   '1900-01-01'))
+
+        FROM CB cb
+        JOIN ARPayment p ON p.DocKey = cb.SourceKey
+        JOIN ARPaymentKnockOff k ON k.DocKey = p.DocKey
+        JOIN ARInvoice ar ON ar.DocKey = k.KnockOffDocKey
+        GROUP BY cb.DocKey, cb.SourceKey
+    )
+    UPDATE cb
+    SET
+        cb.UDF_LOANNO =
+            CASE
+                WHEN ISNULL(LTRIM(RTRIM(cb.UDF_LOANNO)), '') = ''
+                THEN NULLIF(s.LoanList, '')
+                ELSE cb.UDF_LOANNO
+            END,
+
+        cb.UDF_MEMBER =
+            CASE
+                WHEN ISNULL(LTRIM(RTRIM(cb.UDF_MEMBER)), '') = ''
+                THEN NULLIF(s.MemberList, '')
+                ELSE cb.UDF_MEMBER
+            END,
+
+        cb.UDF_STARTDATE =
+            CASE
+                WHEN cb.UDF_STARTDATE IS NULL
+                THEN s.StartDateMin
+                ELSE cb.UDF_STARTDATE
+            END,
+
+        cb.UDF_ENDDATE =
+            CASE
+                WHEN cb.UDF_ENDDATE IS NULL
+                THEN s.EndDateMax
+                ELSE cb.UDF_ENDDATE
+            END
+    FROM CB cb
+    JOIN Src s ON s.CBDocKey = cb.DocKey
+    WHERE
+        ISNULL(LTRIM(RTRIM(cb.UDF_LOANNO)), '') = ''
+     OR ISNULL(LTRIM(RTRIM(cb.UDF_MEMBER)), '') = ''
+     OR cb.UDF_STARTDATE IS NULL
+     OR cb.UDF_ENDDATE IS NULL;
+
+    COMMIT TRAN;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+    THROW;
+END CATCH;
+
+----------------------------------------------------------
+
+3) Fix Tick
+Step 1:
+BEGIN TRY
+    BEGIN TRAN;
+
+    -- Rebuild Paid flag for AR Invoices that have at least 1 knock-off record (meaning they are involved in payment flow)
+    UPDATE i
+    SET i.UDF_PAID =
+        CASE
+            WHEN ISNULL(i.Outstanding, 0) <= 0 THEN 'T'
+            ELSE 'F'
+        END
+    FROM ARInvoice i
+    WHERE EXISTS (
+        SELECT 1
+        FROM ARPaymentKnockOff k
+        WHERE k.KnockOffDocKey = i.DocKey
+    );
+
+    COMMIT TRAN;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+    THROW;
+END CATCH;
+
+
+Step 2:
+BEGIN TRY
+    BEGIN TRAN;
+
+    UPDATE cb
+    SET cb.UDF_PAID =
+        CASE
+            WHEN EXISTS (
+                SELECT 1
+                FROM ARPaymentKnockOff k
+                JOIN ARInvoice i ON i.DocKey = k.KnockOffDocKey
+                WHERE k.DocKey = cb.SourceKey
+                  AND ISNULL(i.Outstanding, 0) > 0
+            )
+            THEN 'F'
+            ELSE 'T'
+        END
+    FROM CB cb
+    WHERE cb.SourceKey IS NOT NULL
+      AND EXISTS (SELECT 1 FROM ARPayment p WHERE p.DocKey = cb.SourceKey);
+
+    COMMIT TRAN;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+    THROW;
+END CATCH;
+
+
+
+-----------MUST DO-------------
+UPDATE IV
+SET UDF_LOANNO =
+    LEFT(UDF_LOANNO, LEN(UDF_LOANNO) - LEN('\cf0\fs20'))
+WHERE UDF_LOANNO LIKE '%\cf0\fs20';
+
+UPDATE ARInvoice
+SET UDF_LOANNO =
+    LEFT(UDF_LOANNO, LEN(UDF_LOANNO) - LEN('\cf0\fs20'))
+WHERE UDF_LOANNO LIKE '%\cf0\fs20';
+
+
+UPDATE CB
+SET UDF_LOANNO =
+    LEFT(UDF_LOANNO, LEN(UDF_LOANNO) - LEN('\cf0\fs20'))
+WHERE UDF_LOANNO LIKE '%\cf0\fs20';
+
+
+
+-------------LAST----------------
+BEGIN TRY
+    BEGIN TRAN;
+
+    -- IV
+    UPDATE IV
+    SET UDF_LOANNO = LTRIM(RTRIM(
+        REPLACE(
+        REPLACE(
+        REPLACE(
+        REPLACE(
+        REPLACE(
+            UDF_LOANNO,
+            '\cf0\fs20',''
+        ),
+            '\cf0\f1\fs20',''
+        ),
+            '\cf1\fs20',''
+        ),
+            '\fs20',''
+        ),
+            '\cf0',''
+        )
+    ))
+    WHERE UDF_LOANNO LIKE '%\cf%' OR UDF_LOANNO LIKE '%\fs%';
+
+    -- ARInvoice
+    UPDATE ARInvoice
+    SET UDF_LOANNO = LTRIM(RTRIM(
+        REPLACE(
+        REPLACE(
+        REPLACE(
+        REPLACE(
+        REPLACE(
+            UDF_LOANNO,
+            '\cf0\fs20',''
+        ),
+            '\cf0\f1\fs20',''
+        ),
+            '\cf1\fs20',''
+        ),
+            '\fs20',''
+        ),
+            '\cf0',''
+        )
+    ))
+    WHERE UDF_LOANNO LIKE '%\cf%' OR UDF_LOANNO LIKE '%\fs%';
+
+    -- CB
+    UPDATE CB
+    SET UDF_LOANNO = LTRIM(RTRIM(
+        REPLACE(
+        REPLACE(
+        REPLACE(
+        REPLACE(
+        REPLACE(
+            UDF_LOANNO,
+            '\cf0\fs20',''
+        ),
+            '\cf0\f1\fs20',''
+        ),
+            '\cf1\fs20',''
+        ),
+            '\fs20',''
+        ),
+            '\cf0',''
+        )
+    ))
+    WHERE UDF_LOANNO LIKE '%\cf%' OR UDF_LOANNO LIKE '%\fs%';
+
+    COMMIT TRAN;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+    THROW;
+END CATCH;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+============ NO NEED first======================
+ Update Start Date, Member, End Date
+BEGIN TRY
+    BEGIN TRAN;
+
+    -- 1) Member (text) - fill only if CB.UDF_MEMBER is empty
+    UPDATE cb
+    SET cb.UDF_MEMBER = iv.UDF_MEMBER
+    FROM CB cb
+    JOIN ARPayment p ON p.DocKey = cb.SourceKey
+    JOIN ARPaymentKnockOff k ON k.DocKey = p.DocKey
+    JOIN ARInvoice ar ON ar.DocKey = k.KnockOffDocKey
+    JOIN IV iv ON iv.DocNo = ar.DocNo
+    WHERE (cb.UDF_MEMBER IS NULL OR LTRIM(RTRIM(cb.UDF_MEMBER)) = '')
+      AND (iv.UDF_MEMBER IS NOT NULL AND LTRIM(RTRIM(iv.UDF_MEMBER)) <> '');
+
+    -- 2) Start Date - fill only if CB.UDF_STARTDATE is null
+    UPDATE cb
+    SET cb.UDF_STARTDATE = iv.UDF_STARTDATE
+    FROM CB cb
+    JOIN ARPayment p ON p.DocKey = cb.SourceKey
+    JOIN ARPaymentKnockOff k ON k.DocKey = p.DocKey
+    JOIN ARInvoice ar ON ar.DocKey = k.KnockOffDocKey
+    JOIN IV iv ON iv.DocNo = ar.DocNo
+    WHERE cb.UDF_STARTDATE IS NULL
+      AND iv.UDF_STARTDATE IS NOT NULL
+      AND iv.UDF_STARTDATE > '1900-01-02';
+
+    -- 3) End Date - fill only if CB.UDF_ENDDATE is null
+    UPDATE cb
+    SET cb.UDF_ENDDATE = iv.UDF_ENDDATE
+    FROM CB cb
+    JOIN ARPayment p ON p.DocKey = cb.SourceKey
+    JOIN ARPaymentKnockOff k ON k.DocKey = p.DocKey
+    JOIN ARInvoice ar ON ar.DocKey = k.KnockOffDocKey
+    JOIN IV iv ON iv.DocNo = ar.DocNo
+    WHERE cb.UDF_ENDDATE IS NULL
+      AND iv.UDF_ENDDATE IS NOT NULL
+      AND iv.UDF_ENDDATE > '1900-01-02';
+
+    COMMIT TRAN;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+    THROW;
+END CATCH;
+
